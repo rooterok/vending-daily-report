@@ -579,21 +579,16 @@ async function main() {
         await page.goto(`${BASE_URL}/vm/curstat.php?bm=${encodeURIComponent(row.bm)}`, {
           waitUntil: 'networkidle',
         });
-        const title = await page.title();
         const bodyText = await page.locator('body').innerText();
-        log(`DIAG curstat bm=${row.bm} title="${title}" body(0..800)="${bodyText.slice(0, 800).replace(/\n+/g, ' | ')}"`);
+        const serialMatch = bodyText.match(/Торговый автомат (\S+) в компании/);
+        const idx = bodyText.indexOf('привязан');
+        const context = idx === -1 ? 'NOT FOUND' : bodyText.slice(Math.max(0, idx - 60), idx + 60).replace(/\n+/g, ' | ');
+        log(
+          `DIAG2 bm=${row.bm} serialMatch=${serialMatch ? serialMatch[1] : 'NONE'} ` +
+            `privyazanContext="${context}" len=${bodyText.length}`
+        );
       } catch (err) {
-        log(`DIAG curstat bm=${row.bm} failed: ${err.message}`);
-      }
-      try {
-        await page.goto(`${BASE_URL}/vm/index.php?bm=${encodeURIComponent(row.bm)}`, {
-          waitUntil: 'networkidle',
-        });
-        const title = await page.title();
-        const bodyText = await page.locator('body').innerText();
-        log(`DIAG index bm=${row.bm} title="${title}" body(0..800)="${bodyText.slice(0, 800).replace(/\n+/g, ' | ')}"`);
-      } catch (err) {
-        log(`DIAG index bm=${row.bm} failed: ${err.message}`);
+        log(`DIAG2 bm=${row.bm} failed: ${err.message}`);
       }
     }
 
