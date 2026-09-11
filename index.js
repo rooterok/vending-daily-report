@@ -62,6 +62,14 @@ async function sendTelegramText(text) {
   return telegramApi('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text });
 }
 
+async function sendTelegramMarkdown(text) {
+  return telegramApi('sendMessage', {
+    chat_id: TELEGRAM_CHAT_ID,
+    text,
+    parse_mode: 'MarkdownV2',
+  });
+}
+
 async function sendTelegramPhoto(pngBuffer, caption) {
   const form = new FormData();
   form.append('chat_id', String(TELEGRAM_CHAT_ID));
@@ -256,10 +264,12 @@ async function ensureLoggedIn(context, page) {
   log(`Saved session to ${SESSION_PATH}`);
 }
 
-async function scrapeMachines(page) {
-  await page.goto(LIST_URL, { waitUntil: 'networkidle' });
-
-  const rows = await page.evaluate(() => {
+// Reads the current state of the machines table. On a fresh page load the
+// grid can briefly show every row cloned from the first one before each
+// row's real data has finished populating - callers should re-read if the
+// result looks duplicated (see scrapeMachines).
+async function readMachineRows(page) {
+  return page.evaluate(() => {
     const table = document.querySelector('table.general_content_table');
     if (!table) return [];
     const trs = Array.from(table.querySelectorAll('tr')).slice(1); // skip header
@@ -274,6 +284,7 @@ async function scrapeMachines(page) {
           type: cells[1] || '',
           address: cells[2] || '',
           location: cells[3] || '',
+          status: cells[6] || '',
           route: cells[8] || '',
           name: cells[9] || '',
           salesRaw: cells[13] || '0',
@@ -281,6 +292,23 @@ async function scrapeMachines(page) {
       })
       .filter(Boolean);
   });
+}
+
+async function scrapeMachines(page) {
+  await page.goto(LIST_URL, { waitUntil: 'networkidle' });
+
+  // Guard against the "all rows still show the first machine's data" race:
+  // re-read a few times until serial numbers are unique, or give up and use
+  // the last read (better than crashing on a transient rendering glitch).
+  let rows = await readMachineRows(page);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const serials = rows.map((r) => r.serial);
+    const unique = new Set(serials).size;
+    if (rows.length === 0 || unique === rows.length) break;
+    log(`Machine rows look duplicated (attempt ${attempt + 1}/5), re-reading...`);
+    await page.waitForTimeout(1000);
+    rows = await readMachineRows(page);
+  }
 
   const hrefs = await page.evaluate(() =>
     Array.from(document.querySelectorAll('a[href*="curstat.php"]')).map((a) =>
@@ -288,62 +316,204 @@ async function scrapeMachines(page) {
     )
   );
 
-  return rows.map((row, i) => {
-    const [countStr, amountStr] = row.salesRaw.includes('/')
-      ? row.salesRaw.split('/')
-      : [row.salesRaw, '0'];
-    const bmMatch = (hrefs[i] || '').match(/bm=([^&]+)/);
-    return {
-      ...row,
-      salesCount: parseInt(countStr, 10) || 0,
-      salesAmount: parseFloat(amountStr) || 0,
-      bm: bmMatch ? bmMatch[1] : null,
-    };
-  });
+  return rows
+    .map((row, i) => {
+      const [countStr, amountStr] = row.salesRaw.includes('/')
+        ? row.salesRaw.split('/')
+        : [row.salesRaw, '0'];
+      const bmMatch = (hrefs[i] || '').match(/bm=([^&]+)/);
+      return {
+        ...row,
+        salesCount: parseInt(countStr, 10) || 0,
+        salesAmount: parseFloat(amountStr) || 0,
+        bm: bmMatch ? bmMatch[1] : null,
+      };
+    })
+    .filter((m) => !m.status.includes('Не привязан')); // archived/unlinked machines
 }
 
+// The per-machine "current errors" page (curerrors.php) is a thin shell that
+// embeds the real, legacy-styled error report inside an iframe
+// (#legacy-frame). That legacy page marks each active error with
+// <font color="FF0000">...</font> - everything else (headings, "no errors
+// found" lines, coin/bill counters) is plain text. We pull out just the red
+// lines, plus their "started at / last confirmed" suffix up to the next <br>.
 async function scrapeErrors(page, bm) {
   if (!bm) return [];
-  await page.goto(`${BASE_URL}/vm/curerrors.php?bm=${bm}`, { waitUntil: 'networkidle' });
-  return page.evaluate(() => {
-    const tables = Array.from(document.querySelectorAll('table.tbl_planogram'));
-    const out = [];
-    for (const t of tables) {
-      for (const tr of Array.from(t.querySelectorAll('tbody tr'))) {
-        const text = tr.innerText.trim().replace(/\s+/g, ' ');
-        if (text) out.push(text);
+  await page.goto(`${BASE_URL}/vm/curerrors.php?bm=${encodeURIComponent(bm)}`, {
+    waitUntil: 'networkidle',
+  });
+
+  const frame = page.frameLocator('#legacy-frame');
+  try {
+    await frame.locator('body').waitFor({ state: 'attached', timeout: 10000 });
+  } catch (err) {
+    log(`Could not load error details frame for bm=${bm}: ${err.message}`);
+    return [];
+  }
+
+  return frame.locator('body').evaluate((body) => {
+    const reds = Array.from(body.querySelectorAll('font[color="FF0000" i]'));
+    return reds.map((el) => {
+      let text = el.textContent || '';
+      let node = el.nextSibling;
+      while (node && !(node.nodeType === 1 && node.nodeName === 'BR')) {
+        text += node.textContent || '';
+        node = node.nextSibling;
       }
-    }
-    return out;
+      return text.replace(/\s+/g, ' ').trim();
+    });
   });
 }
 
-function formatMessage(machines) {
-  const lines = [];
-  const today = new Date().toLocaleDateString('ru-RU', { timeZone: 'Asia/Novosibirsk' });
-  lines.push(`📊 Сводка по автоматам за ${today}`);
-  lines.push('');
+// "К загрузке" (restock list) lives in the same #legacy-frame pattern as the
+// errors page: a plain table with columns [row number, product name, qty to
+// load]. We only keep rows that actually need loading (qty > 0).
+async function scrapeLoadingList(page, bm) {
+  if (!bm) return [];
+  await page.goto(`${BASE_URL}/vm/vmccalcload.php?bm=${encodeURIComponent(bm)}`, {
+    waitUntil: 'networkidle',
+  });
 
-  let totalCount = 0;
-  let totalAmount = 0;
-
-  for (const m of machines) {
-    const title = m.name ? `${m.name} (${m.serial})` : m.serial;
-    lines.push(`🔹 ${title}`);
-    lines.push(`   ${m.address}${m.location ? ', ' + m.location : ''}`);
-    lines.push(`   Продажи: ${m.salesCount} шт. на ${m.salesAmount.toFixed(2)} ₽`);
-    if (m.errors.length === 0) {
-      lines.push(`   Ошибки: нет`);
-    } else {
-      lines.push(`   Ошибки (${m.errors.length}):`);
-      for (const e of m.errors) lines.push(`     - ${e}`);
-    }
-    lines.push('');
-    totalCount += m.salesCount;
-    totalAmount += m.salesAmount;
+  const frame = page.frameLocator('#legacy-frame');
+  try {
+    await frame.locator('body').waitFor({ state: 'attached', timeout: 10000 });
+  } catch (err) {
+    log(`Could not load "to load" frame for bm=${bm}: ${err.message}`);
+    return [];
   }
 
-  lines.push(`Итого: ${totalCount} шт. на ${totalAmount.toFixed(2)} ₽`);
+  const rows = await frame.locator('body').evaluate((body) => {
+    const table = Array.from(body.querySelectorAll('table')).find((t) =>
+      /Наименование/.test(t.innerText)
+    );
+    if (!table) return [];
+    return Array.from(table.querySelectorAll('tr'))
+      .slice(1) // skip header
+      .map((tr) => {
+        const cells = Array.from(tr.querySelectorAll('td,th')).map((c) => c.innerText.trim());
+        return { name: cells[1] || '', qty: cells[2] || '0' };
+      })
+      .filter((r) => r.name);
+  });
+
+  return rows.filter((r) => {
+    const n = parseFloat(r.qty.replace(',', '.'));
+    return !isNaN(n) && n > 0;
+  });
+}
+
+function novosibirskDateParts(date) {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Novosibirsk',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return Object.fromEntries(fmt.formatToParts(date).map((p) => [p.type, p.value]));
+}
+
+// "Анализ продаж" shows, per category (Снеки/Кофе/...), a per-day breakdown
+// as "<count> / <amount>" table cells with dates as column headers
+// (DD-MM-YYYY). We only need today's column. Category rows are marked with
+// the "fs-bigger"/"bg-bluegrey" classes, and always have exactly as many
+// trailing cells as there are date columns (regardless of how many label
+// columns precede them), so we align by counting from the end of the row.
+async function scrapeSalesAnalysis(page, bm) {
+  if (!bm) return { dateLabel: '', categories: [] };
+  await page.goto(`${BASE_URL}/vm/chart.php?bm=${encodeURIComponent(bm)}`, {
+    waitUntil: 'networkidle',
+  });
+
+  const data = await page.evaluate(() => {
+    const table =
+      document.querySelector('table.vmsalestable') ||
+      Array.from(document.querySelectorAll('table')).find(
+        (t) => /Ячейка/.test(t.innerText) && /Итоговые/.test(t.innerText)
+      );
+    if (!table) return null;
+    const trs = Array.from(table.querySelectorAll('tr'));
+    if (trs.length === 0) return null;
+    const headerCells = Array.from(trs[0].querySelectorAll('td,th')).map((c) => c.innerText.trim());
+    const dateRegex = /^\d{2}-\d{2}-\d{4}$/;
+    const dates = headerCells.filter((t) => dateRegex.test(t));
+    const categories = [];
+    for (const tr of trs.slice(1)) {
+      if (!/fs-bigger|bg-bluegrey/.test(tr.className || '')) continue;
+      const cells = Array.from(tr.querySelectorAll('td,th')).map((c) => c.innerText.trim());
+      const dateCells = cells.slice(-dates.length);
+      const byDate = {};
+      dates.forEach((d, i) => {
+        byDate[d] = dateCells[i] || '';
+      });
+      categories.push({ name: cells[0], byDate });
+    }
+    return { dates, categories };
+  });
+
+  if (!data) return { dateLabel: '', categories: [] };
+
+  const { day, month, year } = novosibirskDateParts(new Date());
+  const todayLabel = `${day}-${month}-${year}`;
+
+  const categories = data.categories.map((c) => {
+    const cell = c.byDate[todayLabel] || '';
+    const match = cell.match(/^(\d+)\s*\/\s*([\d.]+)/);
+    return {
+      name: c.name,
+      count: match ? parseInt(match[1], 10) : 0,
+      amount: match ? parseFloat(match[2]) : 0,
+    };
+  });
+
+  return { dateLabel: todayLabel, categories };
+}
+
+// ---------- Telegram MarkdownV2 formatting ----------
+
+function escapeMd(text) {
+  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
+}
+
+function formatMachineMessage(m, index, loadingList, salesData) {
+  const lines = [];
+  const link = `${BASE_URL}/vm/index.php?bm=${encodeURIComponent(m.bm || '')}`;
+  const title = m.name ? `${m.name} (${m.serial})` : m.serial;
+  const addressPart = `${m.address}${m.location ? ', ' + m.location : ''}`;
+  lines.push(`${index}\\. Автомат [${escapeMd(title)}](${link}) \\(${escapeMd(addressPart)}\\)`);
+  lines.push('');
+
+  lines.push('*К загрузке:*');
+  if (loadingList.length === 0) {
+    lines.push(escapeMd('загружать нечего (остатки в норме)'));
+  } else {
+    const tableText = loadingList.map((r) => `${r.name} — ${r.qty}`).join('\n');
+    lines.push(`||${escapeMd(tableText)}||`);
+  }
+  lines.push('');
+
+  lines.push('*Текущие ошибки:*');
+  if (m.errors.length === 0) {
+    lines.push(escapeMd('ошибок нет'));
+  } else {
+    m.errors.forEach((e, i) => lines.push(`${i + 1}\\. ${escapeMd(e)}`));
+  }
+  lines.push('');
+
+  lines.push('*Анализ продаж:*');
+  if (salesData.categories.length === 0) {
+    lines.push(escapeMd('нет данных'));
+  } else {
+    const parts = salesData.categories.map(
+      (c) => `${escapeMd(c.name.toLowerCase())} \\= ${escapeMd(c.amount.toFixed(2))} руб`
+    );
+    const total = salesData.categories.reduce((s, c) => s + c.amount, 0);
+    const [dd, mm] = salesData.dateLabel ? salesData.dateLabel.split('-') : ['', ''];
+    lines.push(
+      `${escapeMd(`${dd}.${mm}`)}  ${parts.join(', ')}\\. Всего ${escapeMd(total.toFixed(2))} руб\\.`
+    );
+  }
+
   return lines.join('\n');
 }
 
@@ -364,13 +534,32 @@ async function main() {
     await ensureLoggedIn(context, page);
 
     const machines = await scrapeMachines(page);
-    for (const m of machines) {
-      m.errors = await scrapeErrors(page, m.bm);
-    }
 
-    const message = formatMessage(machines);
-    log(message);
-    await sendTelegramText(message);
+    const today = new Date().toLocaleDateString('ru-RU', { timeZone: 'Asia/Novosibirsk' });
+    const totalCount = machines.reduce((s, m) => s + m.salesCount, 0);
+    const totalAmount = machines.reduce((s, m) => s + m.salesAmount, 0);
+    await sendTelegramText(
+      `📊 Сводка по автоматам за ${today}\n` +
+        `Автоматов: ${machines.length}. Итого продаж: ${totalCount} шт. на ${totalAmount.toFixed(2)} ₽`
+    );
+
+    let index = 1;
+    for (const m of machines) {
+      try {
+        m.errors = await scrapeErrors(page, m.bm);
+        const loadingList = await scrapeLoadingList(page, m.bm);
+        const salesData = await scrapeSalesAnalysis(page, m.bm);
+        const msg = formatMachineMessage(m, index, loadingList, salesData);
+        log(msg);
+        await sendTelegramMarkdown(msg);
+      } catch (err) {
+        log(`Failed to build/send report for machine ${m.serial}: ${err.message}`);
+        await sendTelegramText(
+          `⚠️ Не удалось собрать отчёт по автомату ${m.serial}: ${err.message}`
+        );
+      }
+      index++;
+    }
     log('Report sent to Telegram.');
   } catch (err) {
     console.error('Fatal error:', err);
