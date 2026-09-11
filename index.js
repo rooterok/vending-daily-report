@@ -634,6 +634,12 @@ async function main() {
           `DIAG2 bm=${row.bm} serialMatch=${serialMatch ? serialMatch[1] : 'NONE'} ` +
             `privyazanContext="${context}" len=${bodyText.length}`
         );
+        // TEMP DIAGNOSTIC: curstat.php bodies differ in LENGTH per bm
+        // (2530/2426/2510/2632) even though the list table is fully
+        // duplicated - meaning this page is NOT duplicated and genuinely
+        // differs per bm. Dump the full text (flattened to one line) to
+        // find whatever marks the archived/not-installed machine.
+        log(`DIAG5 bm=${row.bm} fulltext=${bodyText.replace(/\s+/g, ' ').trim()}`);
       } catch (err) {
         log(`DIAG2 bm=${row.bm} failed: ${err.message}`);
       }
