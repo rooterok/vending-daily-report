@@ -33,7 +33,16 @@ const LAST_AUTO_RUN_PATH = process.env.LAST_AUTO_RUN_PATH || '/data/last_auto_ru
 const SITE_LOGIN = requireEnv('SITE_LOGIN');
 const SITE_PASSWORD = requireEnv('SITE_PASSWORD');
 const TELEGRAM_BOT_TOKEN = requireEnv('TELEGRAM_BOT_TOKEN');
+// The owner's personal chat - used for login/captcha prompts and crash
+// alerts, and always one of the report recipients.
 const TELEGRAM_CHAT_ID = requireEnv('TELEGRAM_CHAT_ID');
+// Optional extra chat ids (e.g. a shared team group) that also receive
+// reports and can trigger the "/report" command, comma-separated.
+const TELEGRAM_EXTRA_CHAT_IDS = (process.env.TELEGRAM_EXTRA_CHAT_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const REPORT_CHAT_IDS = Array.from(new Set([String(TELEGRAM_CHAT_ID), ...TELEGRAM_EXTRA_CHAT_IDS]));
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
 
 const TIMEZONE = 'Asia/Novosibirsk';
@@ -80,16 +89,41 @@ async function telegramApi(method, body) {
   return data.result;
 }
 
-async function sendTelegramText(text) {
-  return telegramApi('sendMessage', { chat_id: TELEGRAM_CHAT_ID, text });
+async function sendTelegramText(text, chatId = TELEGRAM_CHAT_ID) {
+  return telegramApi('sendMessage', { chat_id: chatId, text });
 }
 
-async function sendTelegramMarkdown(text) {
+async function sendTelegramMarkdown(text, chatId = TELEGRAM_CHAT_ID) {
   return telegramApi('sendMessage', {
-    chat_id: TELEGRAM_CHAT_ID,
+    chat_id: chatId,
     text,
     parse_mode: 'MarkdownV2',
   });
+}
+
+// Reports go to every configured chat (the owner's personal chat plus any
+// extra chats such as a shared team group - see TELEGRAM_EXTRA_CHAT_IDS).
+// Login/captcha prompts and crash alerts stay personal-only (sendTelegramText
+// / sendTelegramMarkdown above, called with no chatId), since those aren't
+// meant for the whole team.
+async function broadcastText(text) {
+  for (const chatId of REPORT_CHAT_IDS) {
+    try {
+      await sendTelegramText(text, chatId);
+    } catch (err) {
+      log(`Failed to send to chat ${chatId}: ${err.message}`);
+    }
+  }
+}
+
+async function broadcastMarkdown(text) {
+  for (const chatId of REPORT_CHAT_IDS) {
+    try {
+      await sendTelegramMarkdown(text, chatId);
+    } catch (err) {
+      log(`Failed to send to chat ${chatId}: ${err.message}`);
+    }
+  }
 }
 
 async function sendTelegramPhoto(pngBuffer, caption) {
@@ -169,10 +203,26 @@ async function telegramUpdateLoop() {
     for (const u of updates) {
       offset = u.update_id + 1;
       const msg = u.message;
-      if (!msg || String(msg.chat.id) !== String(TELEGRAM_CHAT_ID)) continue;
+      if (!msg) continue;
+      const chatId = String(msg.chat.id);
       const text = (msg.text || '').trim();
 
-      if (pendingCaptchaWait && msg.date * 1000 >= pendingCaptchaWait.sentAtMs) {
+      // Not a chat we know about (personal or an extra/group chat from
+      // TELEGRAM_EXTRA_CHAT_IDS) - log it so its chat id can be found (e.g.
+      // right after adding the bot to a new group chat and sending a test
+      // message there), then ignore it.
+      if (!REPORT_CHAT_IDS.includes(chatId)) {
+        log(
+          `Message from an unconfigured chat_id=${chatId} (type=${msg.chat.type}, title="${
+            msg.chat.title || msg.chat.username || ''
+          }"): "${text}" - add this id to TELEGRAM_EXTRA_CHAT_IDS if it should receive reports.`
+        );
+        continue;
+      }
+
+      // Captcha replies are only ever expected in the owner's personal chat
+      // (that's where the captcha photo was sent).
+      if (chatId === String(TELEGRAM_CHAT_ID) && pendingCaptchaWait && msg.date * 1000 >= pendingCaptchaWait.sentAtMs) {
         const match = text.match(/\d{4,6}/);
         if (match) {
           log(`Got human captcha reply: ${match[0]}`);
@@ -658,7 +708,7 @@ async function generateAndSendReport(page, dateLabel, dateRu, headerNote) {
 
   const totalCount = machines.reduce((s, m) => s + m.salesCount, 0);
   const totalAmount = machines.reduce((s, m) => s + m.salesAmount, 0);
-  await sendTelegramText(
+  await broadcastText(
     `📊 Сводка по автоматам за ${dateRu} ${headerNote}\n` +
       `Автоматов: ${machines.length}. Итого продаж: ${totalCount} шт. на ${totalAmount.toFixed(2)} ₽`
   );
@@ -668,10 +718,10 @@ async function generateAndSendReport(page, dateLabel, dateRu, headerNote) {
     try {
       const msg = formatMachineMessage(m, index, m.loadingList, m.salesData);
       log(msg);
-      await sendTelegramMarkdown(msg);
+      await broadcastMarkdown(msg);
     } catch (err) {
       log(`Failed to build/send report for machine ${m.serial}: ${err.message}`);
-      await sendTelegramText(`⚠️ Не удалось собрать отчёт по автомату ${m.serial}: ${err.message}`);
+      await broadcastText(`⚠️ Не удалось собрать отчёт по автомату ${m.serial}: ${err.message}`);
     }
     index++;
   }
