@@ -585,26 +585,29 @@ async function main() {
     try {
       const rawDump = await page.evaluate(() => {
         const table = document.querySelector('table.general_content_table');
-        if (!table) return null;
+        if (!table) return [];
         const trs = Array.from(table.querySelectorAll('tr')).slice(1);
-        return trs.map((tr) => ({
-          trTitle: tr.getAttribute('title') || '',
-          trClass: tr.className || '',
-          cells: Array.from(tr.querySelectorAll('td,th')).map((c) => ({
-            text: c.innerText.trim().replace(/\s+/g, ' '),
-            title: c.getAttribute('title') || '',
-            className: c.className || '',
-            imgs: Array.from(c.querySelectorAll('img')).map((img) => ({
-              src: (img.getAttribute('src') || '').split('/').pop(),
-              alt: img.getAttribute('alt') || '',
-              title: img.getAttribute('title') || '',
-            })),
-          })),
-        }));
+        return trs.map((tr) => {
+          const cells = Array.from(tr.querySelectorAll('td,th'));
+          return {
+            trTitle: tr.getAttribute('title') || '',
+            trClass: String(tr.className || ''),
+            cellTexts: cells.map((c) => c.innerText.trim().replace(/\s+/g, ' ')),
+            cellTitles: cells.map((c) => c.getAttribute('title') || ''),
+            cellClasses: cells.map((c) => String(c.className || '')),
+            imgSrcs: cells.map((c) => {
+              const img = c.querySelector('img');
+              return img ? (img.getAttribute('src') || '').split('/').pop() : '';
+            }),
+          };
+        });
       });
-      (rawDump || []).forEach((row, i) => {
-        const json = JSON.stringify(row);
-        log(`DIAG4 row${i} len=${json.length} ${json.slice(0, 1500)}`);
+      rawDump.forEach((row, i) => {
+        log(`DIAG4 row${i} trTitle="${row.trTitle}" trClass="${row.trClass}"`);
+        log(`DIAG4 row${i} texts=${row.cellTexts.join(' | ')}`);
+        log(`DIAG4 row${i} titles=${row.cellTitles.join(' | ')}`);
+        log(`DIAG4 row${i} classes=${row.cellClasses.join(' | ')}`);
+        log(`DIAG4 row${i} imgSrcs=${row.imgSrcs.join(' | ')}`);
       });
     } catch (err) {
       log(`DIAG4 failed: ${err.message}`);
