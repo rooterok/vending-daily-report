@@ -348,8 +348,15 @@ function formatMessage(machines) {
 }
 
 async function main() {
-  const browser = await chromium.launch({ headless: true });
+  log('Bot run starting...');
+  let browser;
   try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    log('Browser launched.');
+
     const contextOptions = fs.existsSync(SESSION_PATH) ? { storageState: SESSION_PATH } : {};
     const context = await browser.newContext(contextOptions);
     const page = await context.newPage();
@@ -368,14 +375,34 @@ async function main() {
   } catch (err) {
     console.error('Fatal error:', err);
     try {
-      await sendTelegramText(`⚠️ Ошибка при формировании сводки по автоматам:\n${err.message}`);
-    } catch (_) {
-      /* ignore secondary failure */
+      await sendTelegramText(`⚠️ Ошибка при формировании сводки по автоматам:\n${err.stack || err.message}`);
+    } catch (notifyErr) {
+      console.error('Also failed to notify Telegram:', notifyErr);
     }
     process.exitCode = 1;
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
   }
 }
+
+process.on('unhandledRejection', async (reason) => {
+  console.error('Unhandled rejection:', reason);
+  try {
+    await sendTelegramText(`⚠️ Необработанная ошибка в боте автоматов:\n${reason?.stack || reason}`);
+  } catch (_) {
+    /* ignore */
+  }
+  process.exit(1);
+});
+
+process.on('uncaughtException', async (err) => {
+  console.error('Uncaught exception:', err);
+  try {
+    await sendTelegramText(`⚠️ Необработанное исключение в боте автоматов:\n${err.stack || err.message}`);
+  } catch (_) {
+    /* ignore */
+  }
+  process.exit(1);
+});
 
 main();
