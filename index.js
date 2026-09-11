@@ -576,6 +576,46 @@ async function main() {
       );
     });
 
+    // TEMP DIAGNOSTIC: dump every cell of every row (all columns, plus any
+    // title/class/img attributes) straight from the DOM, with no column
+    // mapping applied, to find whether ANY column/attribute genuinely
+    // differs per row (e.g. a hidden tooltip, class, or data attribute
+    // marking the archived machine) even though the visible text columns
+    // we picked (serial/name/address/status) are all identical to row 1.
+    try {
+      const rawDump = await page.evaluate(() => {
+        const table = document.querySelector('table.general_content_table');
+        if (!table) return null;
+        const trs = Array.from(table.querySelectorAll('tr')).slice(1);
+        return trs.map((tr) => ({
+          trTitle: tr.getAttribute('title') || '',
+          trClass: tr.className || '',
+          cells: Array.from(tr.querySelectorAll('td,th')).map((c) => ({
+            text: c.innerText.trim().replace(/\s+/g, ' '),
+            title: c.getAttribute('title') || '',
+            className: c.className || '',
+            imgs: Array.from(c.querySelectorAll('img')).map((img) => ({
+              src: (img.getAttribute('src') || '').split('/').pop(),
+              alt: img.getAttribute('alt') || '',
+              title: img.getAttribute('title') || '',
+            })),
+          })),
+        }));
+      });
+      (rawDump || []).forEach((row, i) => {
+        log(`DIAG4 row${i} trTitle="${row.trTitle}" trClass="${row.trClass}"`);
+        row.cells.forEach((c, ci) => {
+          if (c.text || c.title || c.imgs.length) {
+            log(
+              `DIAG4 row${i} cell${ci} text="${c.text}" title="${c.title}" class="${c.className}" imgs=${JSON.stringify(c.imgs)}`
+            );
+          }
+        });
+      });
+    } catch (err) {
+      log(`DIAG4 failed: ${err.message}`);
+    }
+
     // TEMP DIAGNOSTIC: the machines-list table's serial/name/address/status
     // columns have been showing identical (row-1) text for every row, even
     // though each row's "bm" genuinely points at a different real machine.
