@@ -566,6 +566,16 @@ async function main() {
 
     const rawRows = await scrapeMachines(page);
 
+    // TEMP DIAGNOSTIC: does the raw list-table row (before any per-bm page
+    // visit) actually carry a distinct status per row, or is it duplicated
+    // from row 1 just like serial/name/address seem to be?
+    rawRows.forEach((row, i) => {
+      log(
+        `DIAG3 row${i} bm=${row.bm} serial="${row.serial}" status="${row.status}" ` +
+          `type="${row.type}" address="${row.address}" location="${row.location}"`
+      );
+    });
+
     // TEMP DIAGNOSTIC: the machines-list table's serial/name/address/status
     // columns have been showing identical (row-1) text for every row, even
     // though each row's "bm" genuinely points at a different real machine.
