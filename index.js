@@ -8,6 +8,16 @@
 //  3. If OpenAI can't crack it either, send the captcha photo to Telegram and wait
 //     for the owner to type the digits back as a reply.
 //  4. Scrape per-machine daily sales + current errors and send a summary to Telegram.
+//
+// The process runs continuously (not as a one-shot cron job) so it can also
+// listen for an on-demand "/report" command on Telegram:
+//  - Every day at DAILY_REPORT_HOUR (Novosibirsk time) it automatically sends
+//    a report for the FULL PREVIOUS DAY (e.g. an 08:00 run covers yesterday
+//    00:00-24:00), since that's the only day whose sales are complete by then.
+//  - Sending "/report" (or "отчет"/"отчёт") on Telegram at any time triggers
+//    an immediate report for TODAY so far, in real time.
+// A file on the persistent volume tracks the last date the automatic report
+// ran, so a restart mid-day never sends it twice.
 
 const fs = require('fs');
 const path = require('path');
@@ -18,12 +28,20 @@ const COMPBM = process.env.COMPBM || '/xsAAA==';
 const LOGIN_URL = `${BASE_URL}/machines.php?compbm=${COMPBM}`;
 const LIST_URL = `${BASE_URL}/machines.php?compbm=${COMPBM}&vendsperday=cost`;
 const SESSION_PATH = process.env.SESSION_PATH || '/data/session.json';
+const LAST_AUTO_RUN_PATH = process.env.LAST_AUTO_RUN_PATH || '/data/last_auto_run_date.txt';
 
 const SITE_LOGIN = requireEnv('SITE_LOGIN');
 const SITE_PASSWORD = requireEnv('SITE_PASSWORD');
 const TELEGRAM_BOT_TOKEN = requireEnv('TELEGRAM_BOT_TOKEN');
 const TELEGRAM_CHAT_ID = requireEnv('TELEGRAM_CHAT_ID');
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || null;
+
+const TIMEZONE = 'Asia/Novosibirsk';
+const DAILY_REPORT_HOUR = 8; // local hour to auto-send the full-previous-day report
+// Matches an explicit "/report" command, or any message that mentions
+// "отчет"/"отчёт" (e.g. "сформировать отчёт", "пришли отчет") - this bot
+// only ever gets messages from its owner, so being permissive here is fine.
+const REPORT_COMMAND_RE = /^\/report\b|\bотчет\b|\bотчёт\b/i;
 
 const OPENAI_CAPTCHA_ATTEMPTS = 3;
 const HUMAN_CAPTCHA_ATTEMPTS = 3;
@@ -107,26 +125,66 @@ async function currentUpdateOffset() {
   return updates[updates.length - 1].update_id + 1;
 }
 
-async function waitForHumanCaptcha(sentAtMs) {
+// Telegram only allows ONE long-poll getUpdates call in flight at a time per
+// bot token, so both the "wait for a human captcha reply" flow and the
+// "listen for the /report command" flow have to share a single polling
+// loop instead of each running their own. waitForHumanCaptcha registers
+// itself here and the loop resolves it as soon as a matching reply arrives.
+let pendingCaptchaWait = null;
+
+function waitForHumanCaptcha(sentAtMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      if (pendingCaptchaWait && pendingCaptchaWait.resolve === resolve) {
+        pendingCaptchaWait = null;
+        reject(new Error('Timed out waiting for a captcha reply on Telegram'));
+      }
+    }, HUMAN_REPLY_TIMEOUT_MS);
+    pendingCaptchaWait = { sentAtMs, resolve, reject, timer };
+    log('Waiting for human captcha reply on Telegram...');
+  });
+}
+
+// The single shared Telegram update listener: dispatches captcha replies to
+// waitForHumanCaptcha (above) and the report command to onReportCommand
+// (set by the caller that owns report generation - see main()).
+let onReportCommand = null;
+
+async function telegramUpdateLoop() {
   let offset = await currentUpdateOffset();
-  const deadline = Date.now() + HUMAN_REPLY_TIMEOUT_MS;
-  log('Waiting for human captcha reply on Telegram...');
-  while (Date.now() < deadline) {
-    const updates = await getTelegramUpdates(offset);
+  log('Listening for Telegram updates...');
+  for (;;) {
+    let updates;
+    try {
+      updates = await getTelegramUpdates(offset);
+    } catch (err) {
+      log('Telegram update poll failed, retrying shortly:', err.message);
+      await new Promise((r) => setTimeout(r, 5000));
+      continue;
+    }
     for (const u of updates) {
       offset = u.update_id + 1;
       const msg = u.message;
       if (!msg || String(msg.chat.id) !== String(TELEGRAM_CHAT_ID)) continue;
-      if (msg.date * 1000 < sentAtMs) continue;
       const text = (msg.text || '').trim();
-      const match = text.match(/\d{4,6}/);
-      if (match) {
-        log(`Got human captcha reply: ${match[0]}`);
-        return match[0];
+
+      if (pendingCaptchaWait && msg.date * 1000 >= pendingCaptchaWait.sentAtMs) {
+        const match = text.match(/\d{4,6}/);
+        if (match) {
+          log(`Got human captcha reply: ${match[0]}`);
+          clearTimeout(pendingCaptchaWait.timer);
+          const { resolve } = pendingCaptchaWait;
+          pendingCaptchaWait = null;
+          resolve(match[0]);
+          continue;
+        }
+      }
+
+      if (REPORT_COMMAND_RE.test(text) && onReportCommand) {
+        onReportCommand(text);
       }
     }
   }
-  throw new Error('Timed out waiting for a captcha reply on Telegram');
 }
 
 // ---------- OpenAI captcha solving ----------
@@ -411,14 +469,38 @@ function novosibirskDateParts(date) {
   return Object.fromEntries(fmt.formatToParts(date).map((p) => [p.type, p.value]));
 }
 
+// The chart.php sales table keys its date columns as "DD-MM-YYYY".
+function dashDateLabel(date) {
+  const { day, month, year } = novosibirskDateParts(date);
+  return `${day}-${month}-${year}`;
+}
+
+// For display in messages: "DD.MM.YYYY".
+function dotDateLabel(date) {
+  const { day, month, year } = novosibirskDateParts(date);
+  return `${day}.${month}.${year}`;
+}
+
+function novosibirskHour(date) {
+  const fmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone: TIMEZONE,
+    hour: '2-digit',
+    hour12: false,
+  });
+  return parseInt(fmt.format(date), 10);
+}
+
 // "Анализ продаж" shows, per category (Снеки/Кофе/...), a per-day breakdown
 // as "<count> / <amount>" table cells with dates as column headers
-// (DD-MM-YYYY). We only need today's column. Category rows are marked with
-// the "fs-bigger"/"bg-bluegrey" classes, and always have exactly as many
+// (DD-MM-YYYY). The caller picks which day's column to read (dateLabel, in
+// that same DD-MM-YYYY format - see targetDateLabel) since a report can
+// cover either the full previous day (the daily automatic run) or today so
+// far (an on-demand "/report"). Category rows are marked with the
+// "fs-bigger"/"bg-bluegrey" classes, and always have exactly as many
 // trailing cells as there are date columns (regardless of how many label
 // columns precede them), so we align by counting from the end of the row.
-async function scrapeSalesAnalysis(page, bm) {
-  if (!bm) return { dateLabel: '', categories: [] };
+async function scrapeSalesAnalysis(page, bm, dateLabel) {
+  if (!bm) return { dateLabel, categories: [] };
   await page.goto(`${BASE_URL}/vm/chart.php?bm=${encodeURIComponent(bm)}`, {
     waitUntil: 'networkidle',
   });
@@ -449,13 +531,10 @@ async function scrapeSalesAnalysis(page, bm) {
     return { dates, categories };
   });
 
-  if (!data) return { dateLabel: '', categories: [] };
-
-  const { day, month, year } = novosibirskDateParts(new Date());
-  const todayLabel = `${day}-${month}-${year}`;
+  if (!data) return { dateLabel, categories: [] };
 
   const categories = data.categories.map((c) => {
-    const cell = c.byDate[todayLabel] || '';
+    const cell = c.byDate[dateLabel] || '';
     const match = cell.match(/^(\d+)\s*\/\s*([\d.]+)/);
     return {
       name: c.name,
@@ -464,7 +543,7 @@ async function scrapeSalesAnalysis(page, bm) {
     };
   });
 
-  return { dateLabel: todayLabel, categories };
+  return { dateLabel, categories };
 }
 
 // ---------- Telegram MarkdownV2 formatting ----------
@@ -530,8 +609,75 @@ function formatMachineMessage(m, index, loadingList, salesData) {
   return lines.join('\n');
 }
 
-async function main() {
-  log('Bot run starting...');
+// Runs one full scrape-and-send cycle inside an already-logged-in page,
+// reporting sales for dateLabel (a "DD-MM-YYYY" chart.php column - either
+// yesterday's full day or today so far). headerNote is appended to the
+// summary line's date (e.g. "(за весь день)" or "(данные на 14:32)").
+async function generateAndSendReport(page, dateLabel, dateRu, headerNote) {
+  const bms = await scrapeMachineBms(page);
+  log(`Found ${bms.length} machine(s) in the list: ${bms.join(', ')}`);
+
+  // Build the report machine-by-machine: skip anything not genuinely
+  // online (see scrapeMachineStatus - this is how a registered-but-not-
+  // physically-installed machine like an old/replaced unit gets excluded,
+  // generically, without hardcoding any specific serial number), then pull
+  // its real identity, errors, restock list and the target day's sales.
+  const machines = [];
+  for (const bm of bms) {
+    const status = await scrapeMachineStatus(page, bm);
+    if (!status.online) {
+      log(`Skipping bm=${bm}: not online (status="${status.statusText}")`);
+      continue;
+    }
+
+    const identity = await scrapeMachineIdentity(page, bm);
+    const loadingList = await scrapeLoadingList(page, bm);
+    const salesRaw = await scrapeSalesAnalysis(page, bm, dateLabel);
+    const categories = salesRaw.categories.filter(
+      (c) => c.name.trim().toLowerCase() !== 'ингредиенты' // not a real sales category
+    );
+    const salesData = { dateLabel: salesRaw.dateLabel, categories };
+    const salesCount = categories.reduce((s, c) => s + c.count, 0);
+    const salesAmount = categories.reduce((s, c) => s + c.amount, 0);
+
+    machines.push({
+      bm,
+      serial: identity.serial,
+      address: identity.address,
+      errors: status.errors,
+      loadingList,
+      salesData,
+      salesCount,
+      salesAmount,
+    });
+  }
+
+  const totalCount = machines.reduce((s, m) => s + m.salesCount, 0);
+  const totalAmount = machines.reduce((s, m) => s + m.salesAmount, 0);
+  await sendTelegramText(
+    `📊 Сводка по автоматам за ${dateRu} ${headerNote}\n` +
+      `Автоматов: ${machines.length}. Итого продаж: ${totalCount} шт. на ${totalAmount.toFixed(2)} ₽`
+  );
+
+  let index = 1;
+  for (const m of machines) {
+    try {
+      const msg = formatMachineMessage(m, index, m.loadingList, m.salesData);
+      log(msg);
+      await sendTelegramMarkdown(msg);
+    } catch (err) {
+      log(`Failed to build/send report for machine ${m.serial}: ${err.message}`);
+      await sendTelegramText(`⚠️ Не удалось собрать отчёт по автомату ${m.serial}: ${err.message}`);
+    }
+    index++;
+  }
+  log('Report sent to Telegram.');
+}
+
+// Launches a fresh browser + logged-in page, runs fn(page), and always
+// closes the browser afterwards - used for both the daily automatic run and
+// an on-demand "/report" command, each as its own isolated browser session.
+async function withLoggedInPage(fn) {
   let browser;
   try {
     browser = await chromium.launch({
@@ -545,85 +691,98 @@ async function main() {
     const page = await context.newPage();
 
     await ensureLoggedIn(context, page);
+    await fn(page);
+  } finally {
+    if (browser) await browser.close();
+  }
+}
 
-    const bms = await scrapeMachineBms(page);
-    log(`Found ${bms.length} machine(s) in the list: ${bms.join(', ')}`);
+// Only one report should ever run at a time (shared browser session file on
+// disk, plus it would be confusing to interleave two runs' Telegram
+// messages) - the daily automatic run and an on-demand command both go
+// through this.
+let reportInProgress = false;
 
-    // Build the report machine-by-machine: skip anything not genuinely
-    // online (see scrapeMachineStatus - this is how a registered-but-not-
-    // physically-installed machine like an old/replaced unit gets excluded,
-    // generically, without hardcoding any specific serial number), then pull
-    // its real identity, errors, restock list and today's sales.
-    const machines = [];
-    for (const bm of bms) {
-      const status = await scrapeMachineStatus(page, bm);
-      if (!status.online) {
-        log(`Skipping bm=${bm}: not online (status="${status.statusText}")`);
-        continue;
-      }
-
-      const identity = await scrapeMachineIdentity(page, bm);
-      const loadingList = await scrapeLoadingList(page, bm);
-      const salesRaw = await scrapeSalesAnalysis(page, bm);
-      const categories = salesRaw.categories.filter(
-        (c) => c.name.trim().toLowerCase() !== 'ингредиенты' // not a real sales category
-      );
-      const salesData = { dateLabel: salesRaw.dateLabel, categories };
-      const salesCount = categories.reduce((s, c) => s + c.count, 0);
-      const salesAmount = categories.reduce((s, c) => s + c.amount, 0);
-
-      machines.push({
-        bm,
-        serial: identity.serial,
-        address: identity.address,
-        errors: status.errors,
-        loadingList,
-        salesData,
-        salesCount,
-        salesAmount,
-      });
+async function runReport(kind) {
+  if (reportInProgress) {
+    if (kind === 'manual') {
+      await sendTelegramText('⏳ Отчёт уже формируется, подождите немного.');
     }
-
+    return;
+  }
+  reportInProgress = true;
+  try {
     const now = new Date();
-    const today = now.toLocaleDateString('ru-RU', { timeZone: 'Asia/Novosibirsk' });
-    const fetchedAt = now.toLocaleTimeString('ru-RU', {
-      timeZone: 'Asia/Novosibirsk',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-    const totalCount = machines.reduce((s, m) => s + m.salesCount, 0);
-    const totalAmount = machines.reduce((s, m) => s + m.salesAmount, 0);
-    await sendTelegramText(
-      `📊 Сводка по автоматам за ${today} (данные на ${fetchedAt})\n` +
-        `Автоматов: ${machines.length}. Итого продаж: ${totalCount} шт. на ${totalAmount.toFixed(2)} ₽`
-    );
-
-    let index = 1;
-    for (const m of machines) {
-      try {
-        const msg = formatMachineMessage(m, index, m.loadingList, m.salesData);
-        log(msg);
-        await sendTelegramMarkdown(msg);
-      } catch (err) {
-        log(`Failed to build/send report for machine ${m.serial}: ${err.message}`);
-        await sendTelegramText(
-          `⚠️ Не удалось собрать отчёт по автомату ${m.serial}: ${err.message}`
-        );
-      }
-      index++;
+    if (kind === 'daily') {
+      const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      await withLoggedInPage((page) =>
+        generateAndSendReport(page, dashDateLabel(yesterday), dotDateLabel(yesterday), '(за весь день)')
+      );
+    } else {
+      const fetchedAt = now.toLocaleTimeString('ru-RU', {
+        timeZone: TIMEZONE,
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      await withLoggedInPage((page) =>
+        generateAndSendReport(page, dashDateLabel(now), dotDateLabel(now), `(данные на ${fetchedAt})`)
+      );
     }
-    log('Report sent to Telegram.');
   } catch (err) {
-    console.error('Fatal error:', err);
+    console.error('Report run failed:', err);
     try {
       await sendTelegramText(`⚠️ Ошибка при формировании сводки по автоматам:\n${err.stack || err.message}`);
     } catch (notifyErr) {
       console.error('Also failed to notify Telegram:', notifyErr);
     }
-    process.exitCode = 1;
   } finally {
-    if (browser) await browser.close();
+    reportInProgress = false;
   }
+}
+
+function readLastAutoRunDate() {
+  try {
+    return fs.readFileSync(LAST_AUTO_RUN_PATH, 'utf8').trim();
+  } catch (err) {
+    return null;
+  }
+}
+
+function writeLastAutoRunDate(label) {
+  fs.mkdirSync(path.dirname(LAST_AUTO_RUN_PATH), { recursive: true });
+  fs.writeFileSync(LAST_AUTO_RUN_PATH, label);
+}
+
+// Checked once a minute: fires the automatic full-previous-day report once
+// per calendar day, at/after DAILY_REPORT_HOUR Novosibirsk time. Tracking
+// "already ran today" on disk means a restart mid-day never double-sends it.
+async function dailyScheduleLoop() {
+  for (;;) {
+    const now = new Date();
+    const todayLabel = dashDateLabel(now);
+    if (novosibirskHour(now) >= DAILY_REPORT_HOUR && readLastAutoRunDate() !== todayLabel) {
+      log('Time for the daily automatic report...');
+      await runReport('daily');
+      writeLastAutoRunDate(todayLabel);
+    }
+    await new Promise((r) => setTimeout(r, 60 * 1000));
+  }
+}
+
+async function main() {
+  log('Bot service starting (daily auto report + on-demand /report command).');
+
+  onReportCommand = (text) => {
+    log(`Received report command: "${text}"`);
+    runReport('manual');
+  };
+
+  telegramUpdateLoop().catch((err) => {
+    console.error('Telegram update loop crashed:', err);
+    process.exit(1);
+  });
+
+  await dailyScheduleLoop();
 }
 
 process.on('unhandledRejection', async (reason) => {
