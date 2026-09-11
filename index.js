@@ -515,7 +515,10 @@ function formatMachineMessage(m, index, loadingList, salesData) {
     lines.push(escapeMd('нет данных'));
   } else {
     const parts = salesData.categories.map(
-      (c) => `${escapeMd(c.name.toLowerCase())} \\= ${escapeMd(c.amount.toFixed(2))} руб`
+      (c) =>
+        `${escapeMd(c.name.toLowerCase())} ${escapeMd(String(c.count))}шт, ${escapeMd(
+          c.amount.toFixed(2)
+        )} рублей`
     );
     const total = salesData.categories.reduce((s, c) => s + c.amount, 0);
     const [dd, mm] = salesData.dateLabel ? salesData.dateLabel.split('-') : ['', ''];
@@ -581,11 +584,17 @@ async function main() {
       });
     }
 
-    const today = new Date().toLocaleDateString('ru-RU', { timeZone: 'Asia/Novosibirsk' });
+    const now = new Date();
+    const today = now.toLocaleDateString('ru-RU', { timeZone: 'Asia/Novosibirsk' });
+    const fetchedAt = now.toLocaleTimeString('ru-RU', {
+      timeZone: 'Asia/Novosibirsk',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
     const totalCount = machines.reduce((s, m) => s + m.salesCount, 0);
     const totalAmount = machines.reduce((s, m) => s + m.salesAmount, 0);
     await sendTelegramText(
-      `📊 Сводка по автоматам за ${today}\n` +
+      `📊 Сводка по автоматам за ${today} (данные на ${fetchedAt})\n` +
         `Автоматов: ${machines.length}. Итого продаж: ${totalCount} шт. на ${totalAmount.toFixed(2)} ₽`
     );
 
