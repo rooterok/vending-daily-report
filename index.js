@@ -578,26 +578,31 @@ async function main() {
     let index = 1;
     for (const m of machines) {
       try {
-        // A physical machine can have several bm modules (see groupMachines) -
-        // scrape each and merge them into one combined report.
-        let errors = [];
-        let loadingList = [];
+        // A physical machine can have several bm modules (see groupMachines).
+        // The errors and "to load" pages turn out to show the whole cabinet's
+        // data no matter which module's bm you pass in - querying every bm
+        // just repeats the same list several times - so we fetch those once,
+        // from the first module. The sales-analysis chart IS genuinely
+        // per-module (each module sells a different category), so that one
+        // is still fetched per bm and merged.
+        const mainBm = m.bms[0] || null;
+        m.errors = await scrapeErrors(page, mainBm);
+        const loadingList = await scrapeLoadingList(page, mainBm);
+
         const categoriesByName = new Map();
         let dateLabel = '';
         for (const bm of m.bms) {
-          errors = errors.concat(await scrapeErrors(page, bm));
-          loadingList = loadingList.concat(await scrapeLoadingList(page, bm));
           const bmSales = await scrapeSalesAnalysis(page, bm);
           if (bmSales.dateLabel) dateLabel = bmSales.dateLabel;
           for (const c of bmSales.categories) {
+            if (c.name.trim().toLowerCase() === 'ингредиенты') continue; // not a real sales category
             const prev = categoriesByName.get(c.name) || { name: c.name, count: 0, amount: 0 };
             prev.count += c.count;
             prev.amount += c.amount;
             categoriesByName.set(c.name, prev);
           }
         }
-        m.errors = errors;
-        m.bm = m.bms[0] || null;
+        m.bm = mainBm;
         const salesData = { dateLabel, categories: Array.from(categoriesByName.values()) };
         const msg = formatMachineMessage(m, index, loadingList, salesData);
         log(msg);
