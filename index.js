@@ -643,6 +643,38 @@ async function main() {
       } catch (err) {
         log(`DIAG2 bm=${row.bm} failed: ${err.message}`);
       }
+
+      // TEMP DIAGNOSTIC: address alone can't tell the archived machine
+      // apart (PN15271483's address turned out to equal a real active
+      // machine's address - probably an old unit at the same spot).
+      // Check whether recent SALES ACTIVITY (genuinely per-bm, unlike the
+      // list table) differs - an archived/not-installed unit should show
+      // no sales at all.
+      try {
+        const sales = await scrapeSalesAnalysis(page, row.bm);
+        const totalCount = sales.categories.reduce((s, c) => s + (c.count || 0), 0);
+        const totalAmount = sales.categories.reduce((s, c) => s + (c.amount || 0), 0);
+        log(
+          `DIAG6 bm=${row.bm} dateLabel="${sales.dateLabel}" categories=${JSON.stringify(
+            sales.categories
+          )} totalCount=${totalCount} totalAmount=${totalAmount}`
+        );
+      } catch (err) {
+        log(`DIAG6 bm=${row.bm} failed: ${err.message}`);
+      }
+
+      // TEMP DIAGNOSTIC: also check the errors page body text for any
+      // "no communication"/offline wording that might mark an archived unit.
+      try {
+        await page.goto(`${BASE_URL}/vm/curerrors.php?bm=${encodeURIComponent(row.bm)}`, {
+          waitUntil: 'networkidle',
+        });
+        const frame = page.frameLocator('#legacy-frame');
+        const frameBody = await frame.locator('body').innerText({ timeout: 10000 }).catch(() => '(frame body unavailable)');
+        log(`DIAG7 bm=${row.bm} errorsFrameText=${frameBody.replace(/\s+/g, ' ').trim()}`);
+      } catch (err) {
+        log(`DIAG7 bm=${row.bm} failed: ${err.message}`);
+      }
     }
 
     const machines = groupMachines(rawRows);
