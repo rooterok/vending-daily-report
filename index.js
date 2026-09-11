@@ -565,6 +565,38 @@ async function main() {
     await ensureLoggedIn(context, page);
 
     const rawRows = await scrapeMachines(page);
+
+    // TEMP DIAGNOSTIC: the machines-list table's serial/name/address/status
+    // columns have been showing identical (row-1) text for every row, even
+    // though each row's "bm" genuinely points at a different real machine.
+    // Before trusting any other page as a source of correct identity, log
+    // what curstat.php and index.php actually show per bm so we can see
+    // where the real name/address/status text lives. Logged to Railway
+    // console only - not sent to Telegram.
+    for (const row of rawRows) {
+      if (!row.bm) continue;
+      try {
+        await page.goto(`${BASE_URL}/vm/curstat.php?bm=${encodeURIComponent(row.bm)}`, {
+          waitUntil: 'networkidle',
+        });
+        const title = await page.title();
+        const bodyText = await page.locator('body').innerText();
+        log(`DIAG curstat bm=${row.bm} title="${title}" body(0..800)="${bodyText.slice(0, 800).replace(/\n+/g, ' | ')}"`);
+      } catch (err) {
+        log(`DIAG curstat bm=${row.bm} failed: ${err.message}`);
+      }
+      try {
+        await page.goto(`${BASE_URL}/vm/index.php?bm=${encodeURIComponent(row.bm)}`, {
+          waitUntil: 'networkidle',
+        });
+        const title = await page.title();
+        const bodyText = await page.locator('body').innerText();
+        log(`DIAG index bm=${row.bm} title="${title}" body(0..800)="${bodyText.slice(0, 800).replace(/\n+/g, ' | ')}"`);
+      } catch (err) {
+        log(`DIAG index bm=${row.bm} failed: ${err.message}`);
+      }
+    }
+
     const machines = groupMachines(rawRows);
 
     const today = new Date().toLocaleDateString('ru-RU', { timeZone: 'Asia/Novosibirsk' });
