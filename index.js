@@ -41,7 +41,11 @@ const DAILY_REPORT_HOUR = 8; // local hour to auto-send the full-previous-day re
 // Matches an explicit "/report" command, or any message that mentions
 // "отчет"/"отчёт" (e.g. "сформировать отчёт", "пришли отчет") - this bot
 // only ever gets messages from its owner, so being permissive here is fine.
-const REPORT_COMMAND_RE = /^\/report\b|\bотчет\b|\bотчёт\b/i;
+// NOTE: no \b word-boundary around the Cyrillic words - JS regex \b is
+// defined in terms of ASCII \w, so it never matches next to Cyrillic
+// letters (they're never treated as "word" chars), meaning \bотчёт\b would
+// silently never match anything.
+const REPORT_COMMAND_RE = /^\/report\b|отчет|отчёт/i;
 
 const OPENAI_CAPTCHA_ATTEMPTS = 3;
 const HUMAN_CAPTCHA_ATTEMPTS = 3;
