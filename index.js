@@ -264,101 +264,75 @@ async function ensureLoggedIn(context, page) {
   log(`Saved session to ${SESSION_PATH}`);
 }
 
-// Reads the current state of the machines table. On a fresh page load the
-// grid can briefly show every row cloned from the first one before each
-// row's real data has finished populating - callers should re-read if the
-// result looks duplicated (see scrapeMachines).
-async function readMachineRows(page) {
-  return page.evaluate(() => {
-    const table = document.querySelector('table.general_content_table');
-    if (!table) return [];
-    const trs = Array.from(table.querySelectorAll('tr')).slice(1); // skip header
-    return trs
-      .map((tr) => {
-        const cells = Array.from(tr.querySelectorAll('td,th')).map((c) =>
-          c.innerText.trim().replace(/\s+/g, ' ')
-        );
-        if (!cells[0]) return null;
-        return {
-          serial: cells[0],
-          type: cells[1] || '',
-          address: cells[2] || '',
-          location: cells[3] || '',
-          status: cells[6] || '',
-          route: cells[8] || '',
-          name: cells[9] || '',
-          salesRaw: cells[13] || '0',
-        };
-      })
-      .filter(Boolean);
-  });
-}
-
-async function scrapeMachines(page) {
+// The machines-list table (machines.php) has a genuine site bug: every
+// row's visible text (serial, name, address, location, status - literally
+// every cell, plus any title/class/img attributes) is rendered identical to
+// row 1's, no matter which real machine that row actually represents. The
+// only trustworthy thing on this page is each row's link to curstat.php,
+// whose "bm" query param genuinely identifies a distinct real machine.
+// Real identity (serial/address) and online status must be read per-bm from
+// curstat.php / curerrors.php instead - see scrapeMachineIdentity and
+// scrapeMachineStatus below.
+async function scrapeMachineBms(page) {
   await page.goto(LIST_URL, { waitUntil: 'networkidle' });
 
-  // The table can briefly be empty right after navigation - give it a moment
-  // to render before reading.
-  let rows = await readMachineRows(page);
-  for (let attempt = 0; attempt < 5 && rows.length === 0; attempt++) {
-    log(`Machine table empty (attempt ${attempt + 1}/5), re-reading...`);
+  // Right after navigation the table (and its links) can briefly be empty -
+  // give it a moment to render before reading.
+  let hrefs = await readCurstatHrefs(page);
+  for (let attempt = 0; attempt < 5 && hrefs.length === 0; attempt++) {
+    log(`Machine links empty (attempt ${attempt + 1}/5), re-reading...`);
     await page.waitForTimeout(1000);
-    rows = await readMachineRows(page);
+    hrefs = await readCurstatHrefs(page);
   }
 
-  const hrefs = await page.evaluate(() =>
+  const bms = hrefs
+    .map((href) => (href || '').match(/bm=([^&]+)/))
+    .map((m) => (m ? m[1] : null))
+    .filter(Boolean);
+
+  // A machine can appear more than once in the table (route re-listing);
+  // de-duplicate by bm.
+  return Array.from(new Set(bms));
+}
+
+function readCurstatHrefs(page) {
+  return page.evaluate(() =>
     Array.from(document.querySelectorAll('a[href*="curstat.php"]')).map((a) =>
       a.getAttribute('href')
     )
   );
-
-  return rows
-    .map((row, i) => {
-      const [countStr, amountStr] = row.salesRaw.includes('/')
-        ? row.salesRaw.split('/')
-        : [row.salesRaw, '0'];
-      const bmMatch = (hrefs[i] || '').match(/bm=([^&]+)/);
-      return {
-        ...row,
-        salesCount: parseInt(countStr, 10) || 0,
-        salesAmount: parseFloat(amountStr) || 0,
-        bm: bmMatch ? bmMatch[1] : null,
-      };
-    })
-    .filter((m) => !m.status.includes('Не привязан')); // archived/unlinked machines
 }
 
-// Some physical vending machines are registered in UOnline as several
-// independently-monitored modules (e.g. a snack module and a hot-drinks
-// module inside the same cabinet) - they show up as separate rows sharing
-// the same serial/name/address but with different "bm" board IDs, and each
-// has its own errors/loading-list/sales data. Group those rows back into one
-// physical machine per report, merging their per-module data, so the same
-// cabinet isn't reported to the owner multiple times.
-function groupMachines(rows) {
-  const groups = new Map();
-  for (const row of rows) {
-    const key = `${row.serial}|${row.address}|${row.location}`;
-    let group = groups.get(key);
-    if (!group) {
-      group = { ...row, bms: [], salesCount: 0, salesAmount: 0 };
-      groups.set(key, group);
-    }
-    if (row.bm) group.bms.push(row.bm);
-    group.salesCount += row.salesCount;
-    group.salesAmount += row.salesAmount;
-  }
-  return Array.from(groups.values());
+// curstat.php genuinely differs per bm (unlike the list table). It shows the
+// machine's real serial ("Торговый автомат <serial> в компании ...") and,
+// right after the GUID line, its installation address.
+async function scrapeMachineIdentity(page, bm) {
+  await page.goto(`${BASE_URL}/vm/curstat.php?bm=${encodeURIComponent(bm)}`, {
+    waitUntil: 'networkidle',
+  });
+  const bodyText = await page.locator('body').innerText();
+  const serialMatch = bodyText.match(/Торговый автомат (\S+) в компании/);
+  const addressMatch = bodyText.match(/GUID = \S+\s+(.+?)\s+Переопределять/);
+  return {
+    serial: serialMatch ? serialMatch[1] : bm,
+    address: addressMatch ? addressMatch[1].trim() : '',
+  };
 }
 
 // The per-machine "current errors" page (curerrors.php) is a thin shell that
 // embeds the real, legacy-styled error report inside an iframe
-// (#legacy-frame). That legacy page marks each active error with
-// <font color="FF0000">...</font> - everything else (headings, "no errors
-// found" lines, coin/bill counters) is plain text. We pull out just the red
-// lines, plus their "started at / last confirmed" suffix up to the next <br>.
-async function scrapeErrors(page, bm) {
-  if (!bm) return [];
+// (#legacy-frame). Its first line reads "Статус: OnLine." (or similar) with
+// a "Последний обмен данными" timestamp - this is the generic, per-bm signal
+// for whether a machine is actually installed and running: a machine that
+// isn't (e.g. removed/replaced hardware still left registered in the
+// system) shows a non-"OnLine" status such as "модем удален" with a stale
+// last-exchange date, instead of a hardcoded serial check. Active errors are
+// marked with <font color="FF0000">...</font> in the same page; everything
+// else (headings, "no errors found" lines, coin/bill counters) is plain
+// text. We pull out the status plus just the red error lines (with their
+// "started at / last confirmed" suffix up to the next <br>).
+async function scrapeMachineStatus(page, bm) {
+  if (!bm) return { online: false, statusText: '', errors: [] };
   await page.goto(`${BASE_URL}/vm/curerrors.php?bm=${encodeURIComponent(bm)}`, {
     waitUntil: 'networkidle',
   });
@@ -368,12 +342,12 @@ async function scrapeErrors(page, bm) {
     await frame.locator('body').waitFor({ state: 'attached', timeout: 10000 });
   } catch (err) {
     log(`Could not load error details frame for bm=${bm}: ${err.message}`);
-    return [];
+    return { online: false, statusText: '', errors: [] };
   }
 
-  return frame.locator('body').evaluate((body) => {
+  const { fullText, errors } = await frame.locator('body').evaluate((body) => {
     const reds = Array.from(body.querySelectorAll('font[color="FF0000" i]'));
-    return reds.map((el) => {
+    const errs = reds.map((el) => {
       let text = el.textContent || '';
       let node = el.nextSibling;
       while (node && !(node.nodeType === 1 && node.nodeName === 'BR')) {
@@ -382,7 +356,12 @@ async function scrapeErrors(page, bm) {
       }
       return text.replace(/\s+/g, ' ').trim();
     });
+    return { fullText: body.innerText, errors: errs };
   });
+
+  const statusMatch = fullText.match(/Статус:\s*([^.]+)\./);
+  const statusText = statusMatch ? statusMatch[1].trim() : '';
+  return { online: statusText === 'OnLine', statusText, errors };
 }
 
 // "К загрузке" (restock list) lives in the same #legacy-frame pattern as the
@@ -564,124 +543,47 @@ async function main() {
 
     await ensureLoggedIn(context, page);
 
-    const rawRows = await scrapeMachines(page);
+    const bms = await scrapeMachineBms(page);
+    log(`Found ${bms.length} machine(s) in the list: ${bms.join(', ')}`);
 
-    // TEMP DIAGNOSTIC: does the raw list-table row (before any per-bm page
-    // visit) actually carry a distinct status per row, or is it duplicated
-    // from row 1 just like serial/name/address seem to be?
-    rawRows.forEach((row, i) => {
-      log(
-        `DIAG3 row${i} bm=${row.bm} serial="${row.serial}" status="${row.status}" ` +
-          `type="${row.type}" address="${row.address}" location="${row.location}"`
+    // Build the report machine-by-machine: skip anything not genuinely
+    // online (see scrapeMachineStatus - this is how a registered-but-not-
+    // physically-installed machine like an old/replaced unit gets excluded,
+    // generically, without hardcoding any specific serial number), then pull
+    // its real identity, errors, restock list and today's sales.
+    const machines = [];
+    for (const bm of bms) {
+      const status = await scrapeMachineStatus(page, bm);
+      if (!status.online) {
+        log(`Skipping bm=${bm}: not online (status="${status.statusText}")`);
+        continue;
+      }
+
+      const identity = await scrapeMachineIdentity(page, bm);
+      const loadingList = await scrapeLoadingList(page, bm);
+      const salesRaw = await scrapeSalesAnalysis(page, bm);
+      const categories = salesRaw.categories.filter(
+        (c) => c.name.trim().toLowerCase() !== 'ингредиенты' // not a real sales category
       );
-    });
+      const salesData = { dateLabel: salesRaw.dateLabel, categories };
+      const salesCount = categories.reduce((s, c) => s + c.count, 0);
+      const salesAmount = categories.reduce((s, c) => s + c.amount, 0);
 
-    // TEMP DIAGNOSTIC: dump every cell of every row (all columns, plus any
-    // title/class/img attributes) straight from the DOM, with no column
-    // mapping applied, to find whether ANY column/attribute genuinely
-    // differs per row (e.g. a hidden tooltip, class, or data attribute
-    // marking the archived machine) even though the visible text columns
-    // we picked (serial/name/address/status) are all identical to row 1.
-    try {
-      const rawDump = await page.evaluate(() => {
-        const table = document.querySelector('table.general_content_table');
-        if (!table) return [];
-        const trs = Array.from(table.querySelectorAll('tr')).slice(1);
-        return trs.map((tr) => {
-          const cells = Array.from(tr.querySelectorAll('td,th'));
-          return {
-            trTitle: tr.getAttribute('title') || '',
-            trClass: String(tr.className || ''),
-            cellTexts: cells.map((c) => c.innerText.trim().replace(/\s+/g, ' ')),
-            cellTitles: cells.map((c) => c.getAttribute('title') || ''),
-            cellClasses: cells.map((c) => String(c.className || '')),
-            imgSrcs: cells.map((c) => {
-              const img = c.querySelector('img');
-              return img ? (img.getAttribute('src') || '').split('/').pop() : '';
-            }),
-          };
-        });
+      machines.push({
+        bm,
+        serial: identity.serial,
+        address: identity.address,
+        errors: status.errors,
+        loadingList,
+        salesData,
+        salesCount,
+        salesAmount,
       });
-      rawDump.forEach((row, i) => {
-        log(`DIAG4 row${i} trTitle="${row.trTitle}" trClass="${row.trClass}"`);
-        log(`DIAG4 row${i} texts=${row.cellTexts.join(' | ')}`);
-        log(`DIAG4 row${i} titles=${row.cellTitles.join(' | ')}`);
-        log(`DIAG4 row${i} classes=${row.cellClasses.join(' | ')}`);
-        log(`DIAG4 row${i} imgSrcs=${row.imgSrcs.join(' | ')}`);
-      });
-    } catch (err) {
-      log(`DIAG4 failed: ${err.message}`);
     }
-
-    // TEMP DIAGNOSTIC: the machines-list table's serial/name/address/status
-    // columns have been showing identical (row-1) text for every row, even
-    // though each row's "bm" genuinely points at a different real machine.
-    // Before trusting any other page as a source of correct identity, log
-    // what curstat.php and index.php actually show per bm so we can see
-    // where the real name/address/status text lives. Logged to Railway
-    // console only - not sent to Telegram.
-    for (const row of rawRows) {
-      if (!row.bm) continue;
-      try {
-        await page.goto(`${BASE_URL}/vm/curstat.php?bm=${encodeURIComponent(row.bm)}`, {
-          waitUntil: 'networkidle',
-        });
-        const bodyText = await page.locator('body').innerText();
-        const serialMatch = bodyText.match(/Торговый автомат (\S+) в компании/);
-        const idx = bodyText.indexOf('привязан');
-        const context = idx === -1 ? 'NOT FOUND' : bodyText.slice(Math.max(0, idx - 60), idx + 60).replace(/\n+/g, ' | ');
-        log(
-          `DIAG2 bm=${row.bm} serialMatch=${serialMatch ? serialMatch[1] : 'NONE'} ` +
-            `privyazanContext="${context}" len=${bodyText.length}`
-        );
-        // TEMP DIAGNOSTIC: curstat.php bodies differ in LENGTH per bm
-        // (2530/2426/2510/2632) even though the list table is fully
-        // duplicated - meaning this page is NOT duplicated and genuinely
-        // differs per bm. Dump the full text (flattened to one line) to
-        // find whatever marks the archived/not-installed machine.
-        log(`DIAG5 bm=${row.bm} fulltext=${bodyText.replace(/\s+/g, ' ').trim()}`);
-      } catch (err) {
-        log(`DIAG2 bm=${row.bm} failed: ${err.message}`);
-      }
-
-      // TEMP DIAGNOSTIC: address alone can't tell the archived machine
-      // apart (PN15271483's address turned out to equal a real active
-      // machine's address - probably an old unit at the same spot).
-      // Check whether recent SALES ACTIVITY (genuinely per-bm, unlike the
-      // list table) differs - an archived/not-installed unit should show
-      // no sales at all.
-      try {
-        const sales = await scrapeSalesAnalysis(page, row.bm);
-        const totalCount = sales.categories.reduce((s, c) => s + (c.count || 0), 0);
-        const totalAmount = sales.categories.reduce((s, c) => s + (c.amount || 0), 0);
-        log(
-          `DIAG6 bm=${row.bm} dateLabel="${sales.dateLabel}" categories=${JSON.stringify(
-            sales.categories
-          )} totalCount=${totalCount} totalAmount=${totalAmount}`
-        );
-      } catch (err) {
-        log(`DIAG6 bm=${row.bm} failed: ${err.message}`);
-      }
-
-      // TEMP DIAGNOSTIC: also check the errors page body text for any
-      // "no communication"/offline wording that might mark an archived unit.
-      try {
-        await page.goto(`${BASE_URL}/vm/curerrors.php?bm=${encodeURIComponent(row.bm)}`, {
-          waitUntil: 'networkidle',
-        });
-        const frame = page.frameLocator('#legacy-frame');
-        const frameBody = await frame.locator('body').innerText({ timeout: 10000 }).catch(() => '(frame body unavailable)');
-        log(`DIAG7 bm=${row.bm} errorsFrameText=${frameBody.replace(/\s+/g, ' ').trim()}`);
-      } catch (err) {
-        log(`DIAG7 bm=${row.bm} failed: ${err.message}`);
-      }
-    }
-
-    const machines = groupMachines(rawRows);
 
     const today = new Date().toLocaleDateString('ru-RU', { timeZone: 'Asia/Novosibirsk' });
-    const totalCount = rawRows.reduce((s, m) => s + m.salesCount, 0);
-    const totalAmount = rawRows.reduce((s, m) => s + m.salesAmount, 0);
+    const totalCount = machines.reduce((s, m) => s + m.salesCount, 0);
+    const totalAmount = machines.reduce((s, m) => s + m.salesAmount, 0);
     await sendTelegramText(
       `📊 Сводка по автоматам за ${today}\n` +
         `Автоматов: ${machines.length}. Итого продаж: ${totalCount} шт. на ${totalAmount.toFixed(2)} ₽`
@@ -690,33 +592,7 @@ async function main() {
     let index = 1;
     for (const m of machines) {
       try {
-        // A physical machine can have several bm modules (see groupMachines).
-        // The errors and "to load" pages turn out to show the whole cabinet's
-        // data no matter which module's bm you pass in - querying every bm
-        // just repeats the same list several times - so we fetch those once,
-        // from the first module. The sales-analysis chart IS genuinely
-        // per-module (each module sells a different category), so that one
-        // is still fetched per bm and merged.
-        const mainBm = m.bms[0] || null;
-        m.errors = await scrapeErrors(page, mainBm);
-        const loadingList = await scrapeLoadingList(page, mainBm);
-
-        const categoriesByName = new Map();
-        let dateLabel = '';
-        for (const bm of m.bms) {
-          const bmSales = await scrapeSalesAnalysis(page, bm);
-          if (bmSales.dateLabel) dateLabel = bmSales.dateLabel;
-          for (const c of bmSales.categories) {
-            if (c.name.trim().toLowerCase() === 'ингредиенты') continue; // not a real sales category
-            const prev = categoriesByName.get(c.name) || { name: c.name, count: 0, amount: 0 };
-            prev.count += c.count;
-            prev.amount += c.amount;
-            categoriesByName.set(c.name, prev);
-          }
-        }
-        m.bm = mainBm;
-        const salesData = { dateLabel, categories: Array.from(categoriesByName.values()) };
-        const msg = formatMachineMessage(m, index, loadingList, salesData);
+        const msg = formatMachineMessage(m, index, m.loadingList, m.salesData);
         log(msg);
         await sendTelegramMarkdown(msg);
       } catch (err) {
