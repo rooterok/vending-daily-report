@@ -603,14 +603,8 @@ async function main() {
         }));
       });
       (rawDump || []).forEach((row, i) => {
-        log(`DIAG4 row${i} trTitle="${row.trTitle}" trClass="${row.trClass}"`);
-        row.cells.forEach((c, ci) => {
-          if (c.text || c.title || c.imgs.length) {
-            log(
-              `DIAG4 row${i} cell${ci} text="${c.text}" title="${c.title}" class="${c.className}" imgs=${JSON.stringify(c.imgs)}`
-            );
-          }
-        });
+        const json = JSON.stringify(row);
+        log(`DIAG4 row${i} len=${json.length} ${json.slice(0, 1500)}`);
       });
     } catch (err) {
       log(`DIAG4 failed: ${err.message}`);
