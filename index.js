@@ -297,15 +297,11 @@ async function readMachineRows(page) {
 async function scrapeMachines(page) {
   await page.goto(LIST_URL, { waitUntil: 'networkidle' });
 
-  // Guard against the "all rows still show the first machine's data" race:
-  // re-read a few times until serial numbers are unique, or give up and use
-  // the last read (better than crashing on a transient rendering glitch).
+  // The table can briefly be empty right after navigation - give it a moment
+  // to render before reading.
   let rows = await readMachineRows(page);
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const serials = rows.map((r) => r.serial);
-    const unique = new Set(serials).size;
-    if (rows.length === 0 || unique === rows.length) break;
-    log(`Machine rows look duplicated (attempt ${attempt + 1}/5), re-reading...`);
+  for (let attempt = 0; attempt < 5 && rows.length === 0; attempt++) {
+    log(`Machine table empty (attempt ${attempt + 1}/5), re-reading...`);
     await page.waitForTimeout(1000);
     rows = await readMachineRows(page);
   }
@@ -330,6 +326,29 @@ async function scrapeMachines(page) {
       };
     })
     .filter((m) => !m.status.includes('Не привязан')); // archived/unlinked machines
+}
+
+// Some physical vending machines are registered in UOnline as several
+// independently-monitored modules (e.g. a snack module and a hot-drinks
+// module inside the same cabinet) - they show up as separate rows sharing
+// the same serial/name/address but with different "bm" board IDs, and each
+// has its own errors/loading-list/sales data. Group those rows back into one
+// physical machine per report, merging their per-module data, so the same
+// cabinet isn't reported to the owner multiple times.
+function groupMachines(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const key = `${row.serial}|${row.address}|${row.location}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { ...row, bms: [], salesCount: 0, salesAmount: 0 };
+      groups.set(key, group);
+    }
+    if (row.bm) group.bms.push(row.bm);
+    group.salesCount += row.salesCount;
+    group.salesAmount += row.salesAmount;
+  }
+  return Array.from(groups.values());
 }
 
 // The per-machine "current errors" page (curerrors.php) is a thin shell that
@@ -475,6 +494,18 @@ function escapeMd(text) {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 }
 
+// Wraps plain text lines into a Telegram "expandable blockquote" - collapsed
+// by default, tap to expand - so a long list (like a restock table) doesn't
+// eat up the whole message. In MarkdownV2 this is a normal blockquote
+// (each line prefixed with an unescaped ">") that starts right after an
+// empty bold marker "**" and ends with "||" glued to the last line; that
+// unmatched **/|| pair is what tells Telegram's parser to make it
+// expandable instead of a plain always-open blockquote.
+function toExpandableQuote(lines) {
+  const quoted = lines.map((l) => `>${escapeMd(l)}`).join('\n');
+  return `**${quoted}||`;
+}
+
 function formatMachineMessage(m, index, loadingList, salesData) {
   const lines = [];
   const link = `${BASE_URL}/vm/index.php?bm=${encodeURIComponent(m.bm || '')}`;
@@ -487,8 +518,8 @@ function formatMachineMessage(m, index, loadingList, salesData) {
   if (loadingList.length === 0) {
     lines.push(escapeMd('загружать нечего (остатки в норме)'));
   } else {
-    const tableText = loadingList.map((r) => `${r.name} — ${r.qty}`).join('\n');
-    lines.push(`||${escapeMd(tableText)}||`);
+    const tableLines = loadingList.map((r) => `${r.name} — ${r.qty}`);
+    lines.push(toExpandableQuote(tableLines));
   }
   lines.push('');
 
@@ -533,11 +564,12 @@ async function main() {
 
     await ensureLoggedIn(context, page);
 
-    const machines = await scrapeMachines(page);
+    const rawRows = await scrapeMachines(page);
+    const machines = groupMachines(rawRows);
 
     const today = new Date().toLocaleDateString('ru-RU', { timeZone: 'Asia/Novosibirsk' });
-    const totalCount = machines.reduce((s, m) => s + m.salesCount, 0);
-    const totalAmount = machines.reduce((s, m) => s + m.salesAmount, 0);
+    const totalCount = rawRows.reduce((s, m) => s + m.salesCount, 0);
+    const totalAmount = rawRows.reduce((s, m) => s + m.salesAmount, 0);
     await sendTelegramText(
       `📊 Сводка по автоматам за ${today}\n` +
         `Автоматов: ${machines.length}. Итого продаж: ${totalCount} шт. на ${totalAmount.toFixed(2)} ₽`
@@ -546,9 +578,27 @@ async function main() {
     let index = 1;
     for (const m of machines) {
       try {
-        m.errors = await scrapeErrors(page, m.bm);
-        const loadingList = await scrapeLoadingList(page, m.bm);
-        const salesData = await scrapeSalesAnalysis(page, m.bm);
+        // A physical machine can have several bm modules (see groupMachines) -
+        // scrape each and merge them into one combined report.
+        let errors = [];
+        let loadingList = [];
+        const categoriesByName = new Map();
+        let dateLabel = '';
+        for (const bm of m.bms) {
+          errors = errors.concat(await scrapeErrors(page, bm));
+          loadingList = loadingList.concat(await scrapeLoadingList(page, bm));
+          const bmSales = await scrapeSalesAnalysis(page, bm);
+          if (bmSales.dateLabel) dateLabel = bmSales.dateLabel;
+          for (const c of bmSales.categories) {
+            const prev = categoriesByName.get(c.name) || { name: c.name, count: 0, amount: 0 };
+            prev.count += c.count;
+            prev.amount += c.amount;
+            categoriesByName.set(c.name, prev);
+          }
+        }
+        m.errors = errors;
+        m.bm = m.bms[0] || null;
+        const salesData = { dateLabel, categories: Array.from(categoriesByName.values()) };
         const msg = formatMachineMessage(m, index, loadingList, salesData);
         log(msg);
         await sendTelegramMarkdown(msg);
