@@ -1,0 +1,13 @@
+{
+  "name": "vending-daily-report",
+  "version": "1.0.0",
+  "description": "Daily Telegram summary of vending machine sales/errors from online.unicum.ru (UOnline telemetry)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "playwright": "1.56.0"
+  }
+}
