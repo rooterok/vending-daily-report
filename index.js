@@ -101,11 +101,11 @@ async function sendTelegramMarkdown(text, chatId = TELEGRAM_CHAT_ID) {
   });
 }
 
-// Reports go to every configured chat (the owner's personal chat plus any
-// extra chats such as a shared team group - see TELEGRAM_EXTRA_CHAT_IDS).
-// Login/captcha prompts and crash alerts stay personal-only (sendTelegramText
-// / sendTelegramMarkdown above, called with no chatId), since those aren't
-// meant for the whole team.
+// Reports AND login/captcha prompts go to every configured chat (the
+// owner's personal chat plus any extra chats such as a shared team group -
+// see TELEGRAM_EXTRA_CHAT_IDS). Only crash/fatal-error alerts stay
+// personal-only (sendTelegramText / sendTelegramMarkdown above, called with
+// no chatId), since those are an operational concern for the owner only.
 async function broadcastText(text) {
   for (const chatId of REPORT_CHAT_IDS) {
     try {
@@ -126,9 +126,9 @@ async function broadcastMarkdown(text) {
   }
 }
 
-async function sendTelegramPhoto(pngBuffer, caption) {
+async function sendTelegramPhoto(pngBuffer, caption, chatId = TELEGRAM_CHAT_ID) {
   const form = new FormData();
-  form.append('chat_id', String(TELEGRAM_CHAT_ID));
+  form.append('chat_id', String(chatId));
   form.append('caption', caption);
   form.append('photo', new Blob([pngBuffer], { type: 'image/png' }), 'captcha.png');
   const resp = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto`, {
@@ -140,6 +140,18 @@ async function sendTelegramPhoto(pngBuffer, caption) {
     throw new Error(`Telegram sendPhoto error: ${JSON.stringify(data)}`);
   }
   return data.result;
+}
+
+// Login/captcha prompts now go to every configured chat too (personal +
+// any group chats) - whoever sees it first can reply with the digits.
+async function broadcastPhoto(pngBuffer, caption) {
+  for (const chatId of REPORT_CHAT_IDS) {
+    try {
+      await sendTelegramPhoto(pngBuffer, caption, chatId);
+    } catch (err) {
+      log(`Failed to send photo to chat ${chatId}: ${err.message}`);
+    }
+  }
 }
 
 async function getTelegramUpdates(offset) {
@@ -220,9 +232,10 @@ async function telegramUpdateLoop() {
         continue;
       }
 
-      // Captcha replies are only ever expected in the owner's personal chat
-      // (that's where the captcha photo was sent).
-      if (chatId === String(TELEGRAM_CHAT_ID) && pendingCaptchaWait && msg.date * 1000 >= pendingCaptchaWait.sentAtMs) {
+      // Captcha replies can come from any configured chat (personal or a
+      // group) - the captcha photo is broadcast to all of them, so whoever
+      // gets there first can answer it.
+      if (pendingCaptchaWait && msg.date * 1000 >= pendingCaptchaWait.sentAtMs) {
         const match = text.match(/\d{4,6}/);
         if (match) {
           log(`Got human captcha reply: ${match[0]}`);
@@ -339,7 +352,7 @@ async function login(page) {
     const buffer = await captchaImg.screenshot();
 
     const sentAtMs = Date.now();
-    await sendTelegramPhoto(
+    await broadcastPhoto(
       buffer,
       '🔐 Не смог сам разобрать капчу для входа в UOnline.\n' +
         'Ответьте на это сообщение пятью цифрами с картинки (в течение 15 минут).'
@@ -348,10 +361,10 @@ async function login(page) {
 
     if (await attemptLoginOnce(page, digits)) {
       log('Login successful via human entry.');
-      await sendTelegramText('✅ Спасибо, вошёл. Формирую отчёт...');
+      await broadcastText('✅ Спасибо, вошёл. Формирую отчёт...');
       return;
     }
-    await sendTelegramText('❌ Капча не подошла, пробую ещё раз, пришлю новую картинку.');
+    await broadcastText('❌ Капча не подошла, пробую ещё раз, пришлю новую картинку.');
   }
 
   throw new Error(`Failed to log in after ${totalAttempts} attempts`);
