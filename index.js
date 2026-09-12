@@ -506,19 +506,42 @@ async function scrapeLoadingList(page, bm) {
     return [];
   }
 
-  const rows = await frame.locator('body').evaluate((body) => {
-    const table = Array.from(body.querySelectorAll('table')).find((t) =>
+  const { rows, candidateHeaders, pickedIndex } = await frame.locator('body').evaluate((body) => {
+    // The page can contain more than one table with a "Наименование" column
+    // (e.g. a sales/purchase history table alongside the actual restock
+    // list) - on rare occasions (seen right after login, on the first
+    // machine of a run) the wrong one ends up first in DOM order. Prefer
+    // whichever candidate table's own header row mentions "загруз" (as in
+    // "К загрузке"/"Загрузить"), since that's specific to the real restock
+    // list and a sales/history table wouldn't use that word.
+    const candidates = Array.from(body.querySelectorAll('table')).filter((t) =>
       /Наименование/.test(t.innerText)
     );
-    if (!table) return [];
-    return Array.from(table.querySelectorAll('tr'))
+    const headerTextOf = (t) => {
+      const headerRow = t.querySelector('tr');
+      return headerRow ? headerRow.innerText.replace(/\s+/g, ' ').trim() : '';
+    };
+    const candidateHeaders = candidates.map(headerTextOf);
+    let pickedIndex = candidates.findIndex((t) => /загруз/i.test(headerTextOf(t)));
+    if (pickedIndex === -1) pickedIndex = candidates.length > 0 ? 0 : -1;
+    const table = pickedIndex >= 0 ? candidates[pickedIndex] : null;
+    if (!table) return { rows: [], candidateHeaders, pickedIndex };
+    const rows = Array.from(table.querySelectorAll('tr'))
       .slice(1) // skip header
       .map((tr) => {
         const cells = Array.from(tr.querySelectorAll('td,th')).map((c) => c.innerText.trim());
         return { name: cells[1] || '', qty: cells[2] || '0' };
       })
       .filter((r) => r.name);
+    return { rows, candidateHeaders, pickedIndex };
   });
+
+  if (candidateHeaders.length > 1) {
+    log(
+      `bm=${bm}: found ${candidateHeaders.length} candidate "loading list" tables, ` +
+        `picked #${pickedIndex} (headers: ${candidateHeaders.map((h, i) => `[${i}] "${h}"`).join(' | ')})`
+    );
+  }
 
   return rows.filter((r) => {
     const n = parseFloat(r.qty.replace(',', '.'));
